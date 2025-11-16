@@ -11,6 +11,53 @@ from .vocab import CustomVocabulary
 logger = logging.getLogger(__name__)
 
 
+# Russian prepositions dictionary
+# These should always be tagged as PREP, not NOUN/INTJ/etc.
+RUSSIAN_PREPOSITIONS = {
+    # Simple prepositions
+    "в",
+    "во",
+    "на",
+    "с",
+    "со",
+    "к",
+    "ко",
+    "по",
+    "за",
+    "из",
+    "изо",
+    "о",
+    "об",
+    "обо",
+    "от",
+    "ото",
+    "до",
+    "для",
+    "при",
+    "про",
+    "без",
+    "безо",
+    "под",
+    "подо",
+    "над",
+    "надо",
+    "перед",
+    "передо",
+    "у",
+    "через",
+    "сквозь",
+    "меж",
+    "между",
+    "вопреки",
+    "согласно",
+    # Compound prepositions (common ones)
+    "из-за",
+    "из-под",
+    "по-над",
+    "по-за",
+}
+
+
 class Russian:
     """Unified API for Russian NLP processing.
 
@@ -112,7 +159,7 @@ class Russian:
             doc.tokens.append(token)
 
     def _analyze_morphology(self, doc: Document) -> None:
-        """Analyze morphology using pymorphy3.
+        """Analyze morphology using pymorphy3 with context-aware disambiguation.
 
         Args:
             doc: Document with tokens
@@ -126,30 +173,270 @@ class Russian:
                 logger.error("mawo-pymorphy3 not installed")
                 return
 
-        # Analyze each token
+        # First pass: get all parses
+        all_parses: list[list[Any]] = []
         for token in doc.tokens:
             # Check custom vocabulary first
             custom_word = self.vocab.get(token.text)
             if custom_word:
                 token.lemma = custom_word.word.lower()
                 token.pos = custom_word.pos
-                token.tag = custom_word.pos  # Simplified
+                token.tag = custom_word.pos
+                all_parses.append([])  # Empty list for custom words
                 continue
 
-            # Use pymorphy3
+            # Get PyMorphy3 parses
             parses = self._morphology.parse(token.text)
+            all_parses.append(parses)
+
+            # Check prepositions (force PREP to fix PyMorphy3 misclassification)
+            word_lower = token.text.lower()
+            if word_lower in RUSSIAN_PREPOSITIONS:
+                # Override POS to PREP but keep the parse for grammar checking
+                token.lemma = word_lower
+                token.pos = "PREP"
+                token.tag = "PREP"
+                # Keep first parse
+                if parses:
+                    token._morphology = parses[0]
+                continue
+
             if not parses:
                 continue
 
-            parse = parses[0]  # Best parse
-
-            # Extract morphology
+            # Store first parse temporarily
+            parse = parses[0]
             token.lemma = getattr(parse, "normal_form", token.text)
             token.pos = getattr(parse.tag, "POS", None) if hasattr(parse, "tag") else None
             token.tag = str(parse.tag) if hasattr(parse, "tag") else None
-
-            # Store full parse for later use
             token._morphology = parse
+
+        # Second pass: context-aware disambiguation
+        self._disambiguate_with_context(doc, all_parses)
+
+    def _disambiguate_with_context(self, doc: Document, all_parses: list[list[Any]]) -> None:
+        """Disambiguate morphology using context (adjective-noun agreement).
+
+        Args:
+            doc: Document with tokens
+            all_parses: All possible parses for each token
+        """
+        tokens = doc.tokens
+
+        for i in range(len(tokens) - 1):
+            current = tokens[i]
+            next_token = tokens[i + 1]
+
+            # Skip if no alternatives or already custom/preposition
+            if not all_parses[i] or not all_parses[i + 1]:
+                continue
+
+            # Adjective-Noun agreement: match gender, case, number
+            if current.pos == "ADJF" and next_token.pos in ("NOUN", "NPRO"):
+                # Try to find a better parse for adjective that matches noun
+                best_parse = self._find_matching_adjective_parse(all_parses[i], next_token)
+                if best_parse:
+                    current.lemma = getattr(best_parse, "normal_form", current.text)
+                    if hasattr(best_parse, "tag"):
+                        current.pos = getattr(best_parse.tag, "POS", None)
+                    else:
+                        current.pos = None
+                    if hasattr(best_parse, "tag"):
+                        current.tag = str(best_parse.tag)
+                    else:
+                        current.tag = None
+                    current._morphology = best_parse
+
+                # ALSO try to find better parse for NOUN that matches adjective
+                # This fixes cases like "невидимой инвалидности" where:
+                # - "невидимой" is correctly identified as gent/sing
+                # - "инвалидности" defaults to nomn/plur but should be gent/sing
+                best_noun_parse = self._find_matching_noun_parse(all_parses[i + 1], current)
+                if best_noun_parse:
+                    next_token.lemma = getattr(best_noun_parse, "normal_form", next_token.text)
+                    if hasattr(best_noun_parse, "tag"):
+                        next_token.pos = getattr(best_noun_parse.tag, "POS", None)
+                    else:
+                        next_token.pos = None
+                    if hasattr(best_noun_parse, "tag"):
+                        next_token.tag = str(best_noun_parse.tag)
+                    else:
+                        next_token.tag = None
+                    next_token._morphology = best_noun_parse
+
+            # Preposition-Noun case government
+            elif current.pos == "PREP" and next_token.pos in ("NOUN", "NPRO", "ADJF"):
+                # Try to find correct case for noun based on preposition
+                best_parse = self._find_preposition_governed_case(
+                    current.text.lower(), all_parses[i + 1], next_token
+                )
+                if best_parse:
+                    next_token.lemma = getattr(best_parse, "normal_form", next_token.text)
+                    if hasattr(best_parse, "tag"):
+                        next_token.pos = getattr(best_parse.tag, "POS", None)
+                    else:
+                        next_token.pos = None
+                    if hasattr(best_parse, "tag"):
+                        next_token.tag = str(best_parse.tag)
+                    else:
+                        next_token.tag = None
+                    next_token._morphology = best_parse
+
+    def _find_matching_adjective_parse(self, parses: list[Any], noun: Token) -> Any:
+        """Find adjective parse that matches noun gender/case/number.
+
+        Args:
+            parses: All possible parses for adjective
+            noun: Noun token to match against
+
+        Returns:
+            Best matching parse or None
+        """
+        noun_gender = noun.gender
+        noun_case = noun.case
+        noun_number = noun.number
+
+        # Try exact match first
+        for parse in parses:
+            if not hasattr(parse, "tag"):
+                continue
+
+            tag = parse.tag
+            if (
+                getattr(tag, "gender", None) == noun_gender
+                and getattr(tag, "case", None) == noun_case
+                and getattr(tag, "number", None) == noun_number
+            ):
+                return parse
+
+        # No better match found
+        return None
+
+    def _find_matching_noun_parse(self, parses: list[Any], adjective: Token) -> Any:
+        """Find noun parse that matches adjective gender/case/number.
+
+        Args:
+            parses: All possible parses for noun
+            adjective: Adjective token to match against
+
+        Returns:
+            Best matching parse or None
+        """
+        if not hasattr(adjective, "_morphology") or not adjective._morphology:
+            return None
+
+        adj_tag = adjective._morphology.tag
+        adj_gender = getattr(adj_tag, "gender", None)
+        adj_case = getattr(adj_tag, "case", None)
+        adj_number = getattr(adj_tag, "number", None)
+
+        # Try exact match first
+        for parse in parses:
+            if not hasattr(parse, "tag"):
+                continue
+
+            tag = parse.tag
+
+            # Check if this is a noun/pronoun
+            if not hasattr(tag, "POS") or tag.POS not in ("NOUN", "NPRO"):
+                continue
+
+            # Match gender, case, and number with adjective
+            noun_gender = getattr(tag, "gender", None)
+            noun_case = getattr(tag, "case", None)
+            noun_number = getattr(tag, "number", None)
+
+            # Gender matching (only in singular)
+            gender_match = True
+            if adj_number == "sing" and noun_number == "sing":
+                if adj_gender and noun_gender:
+                    gender_match = adj_gender == noun_gender
+
+            # Case and number must match
+            case_match = (adj_case == noun_case) if (adj_case and noun_case) else True
+            number_match = (adj_number == noun_number) if (adj_number and noun_number) else True
+
+            if gender_match and case_match and number_match:
+                return parse
+
+        # If no exact match, try to match at least case and number
+        for parse in parses:
+            if not hasattr(parse, "tag"):
+                continue
+
+            tag = parse.tag
+            if not hasattr(tag, "POS") or tag.POS not in ("NOUN", "NPRO"):
+                continue
+
+            noun_case = getattr(tag, "case", None)
+            noun_number = getattr(tag, "number", None)
+
+            # At least case and number should match
+            if noun_case == adj_case and noun_number == adj_number:
+                return parse
+
+        # No better match found
+        return None
+
+    def _find_preposition_governed_case(
+        self, preposition: str, parses: list[Any], noun: Token
+    ) -> Any:
+        """Find noun parse with correct case for preposition.
+
+        Args:
+            preposition: Preposition text (lowercase)
+            parses: All possible parses for noun
+            noun: Noun token
+
+        Returns:
+            Best matching parse or None
+        """
+        # Common preposition + case rules
+        # в, на, о, об, при → prepositional (loct)
+        # к, по → dative (datv)
+        # с, от, из, до, для, без, у, около → genitive (gent)
+        # через, про, за, на (direction) → accusative (accs)
+
+        expected_case = None
+        if preposition in ("в", "во", "на", "о", "об", "обо", "при"):
+            # Can be both loct and accs depending on context
+            # For static location: loct (в школе - in school)
+            # For direction: accs (в школу - to school)
+            # Default to loct for now
+            expected_case = "loct"
+        elif preposition in ("к", "ко", "по"):
+            expected_case = "datv"
+        elif preposition in (
+            "с",
+            "со",
+            "от",
+            "ото",
+            "из",
+            "изо",
+            "до",
+            "для",
+            "без",
+            "безо",
+            "у",
+            "около",
+        ):
+            expected_case = "gent"
+        elif preposition in ("через", "про"):
+            expected_case = "accs"
+
+        if not expected_case:
+            return None
+
+        # Find parse with expected case
+        for parse in parses:
+            if not hasattr(parse, "tag"):
+                continue
+
+            tag = parse.tag
+            if getattr(tag, "case", None) == expected_case:
+                return parse
+
+        return None
 
     def _segment_sentences(self, doc: Document) -> None:
         """Segment text into sentences using razdel.
