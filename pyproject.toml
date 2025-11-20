@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mawo-core"
-version = "0.1.2"
+version = "0.1.3"
 description = "Unified API for Russian NLP - combines razdel, pymorphy3, slovnet, natasha"
 readme = "README.md"
 authors = [
