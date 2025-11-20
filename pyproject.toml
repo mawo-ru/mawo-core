@@ -27,7 +27,6 @@ keywords = ["nlp", "russian", "morphology", "ner", "tokenization", "unified-api"
 dependencies = [
     "mawo-pymorphy3>=1.0.4",
     "mawo-razdel>=1.0.6",
-    "mawo-grammar>=0.2.1",
 ]
 
 [project.optional-dependencies]

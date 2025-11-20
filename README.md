@@ -198,4 +198,3 @@ MIT License - see [LICENSE](LICENSE) for details.
 - [mawo-razdel](https://github.com/mawo-ru/mawo-razdel) - Tokenization
 - [mawo-slovnet](https://github.com/mawo-ru/mawo-slovnet) - NER and syntax
 - [mawo-natasha](https://github.com/mawo-ru/mawo-natasha) - Embeddings
-- [mawo-grammar](https://github.com/mawo-ru/mawo-grammar) - Grammar checking
